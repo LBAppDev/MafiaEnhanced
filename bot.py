@@ -28,6 +28,7 @@ class MafiaBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.lobbies = {}  # channel_id -> GameLobby
+        self.lobbies_lock = asyncio.Lock()
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -220,6 +221,9 @@ class GameLobby:
         self.player_list = []  # Ordered list of player IDs for index-based lookups
         self.recently_joined = []  # Track recently joined players for UI display
         self.last_message = None  # Track last game message for editing instead of sending new ones
+        self.last_panel_phase = None  # Track which phase was used for the last panel message (to resend on phase change)
+        self.lock = asyncio.Lock()  # Prevent concurrent operations on this lobby
+        self.last_panel_phase = None  # Track which phase was last shown on the panel
 
     def get_player_by_index(self, index: int):
         """Get player by their index in the player list."""
@@ -352,6 +356,13 @@ class GameLobby:
         if len(self.players) < 3:
             return False, "Need at least 3 players."
         
+        # Cancel auto-start task if it exists
+        if hasattr(self, 'auto_start_task') and self.auto_start_task and not self.auto_start_task.done():
+            try:
+                self.auto_start_task.cancel()
+            except:
+                pass
+        
         self.status = 'in-game'
         player_ids = list(self.players.keys())
         self.player_list = player_ids  # Store ordered list for index-based lookups
@@ -426,14 +437,85 @@ class GameLobby:
             )
             
             try:
-                # Send ephemeral message to the player (only they see it)
-                # Unfortunately Discord doesn't allow sending pure ephemeral messages to specific users
-                # So we'll store it and send when they interact
+                # Store role reveal embed for ephemeral access via the 'Reveal Role' button
                 if not hasattr(self, 'role_reveals'):
                     self.role_reveals = {}
                 self.role_reveals[pid] = role_embed
             except:
                 pass
+
+    async def update_lobby_panel(self, channel=None, status_text: str = None, view=None):
+        """Edit the original lobby panel message to reflect current players or send it if missing."""
+        embed = self.render_lobby_embed(status_text)
+        use_view = view if view is not None else LobbyView(self)
+        # If transitioning into a game panel (GameView) or the lobby has started, send a new panel message and keep old ones
+        # Avoid importing this module (prevents circular-import side effects).
+        is_game_view = getattr(use_view, '__class__', None).__name__ == 'GameView'
+
+        if channel and (is_game_view or self.status != 'waiting' or not self.last_message):
+            try:
+                msg = await channel.send(embed=embed, view=use_view)
+                self.last_message = msg
+                self.last_panel_phase = self.phase
+                try:
+                    print(f"[DEBUG] Sent lobby panel msg id={getattr(msg, 'id', None)} phase={self.phase}")
+                except:
+                    pass
+                return
+            except:
+                pass
+
+        # Otherwise, try editing the existing lobby message safely
+        if self.last_message:
+            try:
+                await self.last_message.edit(embed=embed, view=use_view)
+                try:
+                    print(f"[DEBUG] Edited lobby panel msg id={getattr(self.last_message, 'id', None)} phase={self.phase}")
+                except:
+                    pass
+                return
+            except Exception as e:
+                print(f"[DEBUG] Lobby edit failed: {e}")
+
+        # Fallback: send a new message if editing failed
+        if channel:
+            try:
+                msg = await channel.send(embed=embed, view=use_view)
+                self.last_message = msg
+                self.last_panel_phase = self.phase
+                try:
+                    print(f"[DEBUG] Lobby fallback sent new panel msg id={getattr(msg, 'id', None)} phase={self.phase}")
+                except:
+                    pass
+            except Exception as e2:
+                print(f"[DEBUG] Lobby fallback send failed: {e2}")
+
+    def start_auto_start(self, bot_instance, countdown: int = 30):
+        """Schedule an auto-start countdown; no-op if already scheduled."""
+        if hasattr(self, 'auto_start_task') and self.auto_start_task and not self.auto_start_task.done():
+            return
+        self.auto_start_task = asyncio.create_task(self._auto_start_countdown(bot_instance, countdown))
+
+    async def _auto_start_countdown(self, bot_instance, countdown: int = 30):
+        """Wait countdown seconds and auto-start the game if conditions are met."""
+        try:
+            await asyncio.sleep(countdown)
+            # If lobby still waiting and enough players, start the game
+            if self.status == 'waiting' and len(self.players) >= 5:
+                async with self.lock:
+                    if self.status != 'waiting':
+                        return
+                    success, msg = self.start_game()
+                    if success:
+                        channel = bot_instance.get_channel(self.channel_id) if bot_instance else None
+                        # Store role_reveals and send initial game panel (use update_view to create the panel)
+                        if channel:
+                            await self.send_role_reveals(channel)
+                            await self.update_view(channel, msg)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            pass
     
     def _setup_night_actions(self):
         """Setup which players must act during night phase."""
@@ -645,10 +727,24 @@ class GameLobby:
             self.winner = 'villager'
             self.status = 'finished'
             await self.update_view(channel, "🏆 **TOWN WINS!** All Mafia eliminated.")
+            try:
+                survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                kicked = getattr(self, 'recent_kicked', [])
+                extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                await channel.send(f"🏆 **TOWN WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+            except:
+                pass
         elif self.mafia_count  >= self.villager_count:
             self.winner = 'mafia'
             self.status = 'finished'
             await self.update_view(channel, "💀 **MAFIA WINS!** They have taken over the town.")
+            try:
+                survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                kicked = getattr(self, 'recent_kicked', [])
+                extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                await channel.send(f"💀 **MAFIA WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+            except:
+                pass
         elif self.status == 'in-game':
              await self.update_view(channel)
     
@@ -704,8 +800,16 @@ class GameLobby:
                 victim = self.players[eliminated_id]
                 victim.is_alive = False
                 
-                self.logs.append(f"⚖️ **{victim.name}** was executed. Role: **{victim.role.upper()}**")
+                mention = getattr(victim.user, 'mention', None) or f"**{victim.name}**"
+                announcement = f"⚖️ {mention} was executed. Role: **{victim.role.upper()}**"
+                self.logs.append(announcement)
                 self.death_log.append((self.round, eliminated_id, victim.role))
+                
+                # Announce publicly as requested (mentions when possible)
+                try:
+                    await channel.send(announcement)
+                except:
+                    pass
                 
                 if victim.role == 'mafia':
                     self.mafia_count -= 1
@@ -753,7 +857,12 @@ class GameLobby:
                             if obs_id != voter_id:
                                 self.update_belief(obs_id, voter_id, WEIGHTS['VOTE_BAD'])
         else:
-            self.logs.append("⚖️ No consensus reached. No one died.")
+            announcement = "⚖️ No consensus reached. No one died."
+            self.logs.append(announcement)
+            try:
+                await channel.send(announcement)
+            except:
+                pass
         self.votes = {}
         self.discussion_events = []  # Reset for next round
         self.discussion_actions_completed = set()  # Reset discussion tracking
@@ -768,11 +877,26 @@ class GameLobby:
             self.winner = 'villager'
             self.status = 'finished'
             await self.update_view(channel, "🏆 **TOWN WINS!** All Mafia eliminated.")
+            # Public final message with survivors and any kicked players
+            try:
+                survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                kicked = getattr(self, 'recent_kicked', [])
+                extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                await channel.send(f"🏆 **TOWN WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+            except:
+                pass
             return
         elif self.mafia_count >= self.villager_count:
             self.winner = 'mafia'
             self.status = 'finished'
             await self.update_view(channel, "💀 **MAFIA WINS!** They have taken over the town.")
+            try:
+                survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                kicked = getattr(self, 'recent_kicked', [])
+                extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                await channel.send(f"💀 **MAFIA WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+            except:
+                pass
             return
         
         self.phase = 'night'
@@ -826,6 +950,14 @@ class GameLobby:
         if mafia_target and mafia_target != 'SKIP':
             if mafia_target == doc_target:
                 self.logs.append("✨ The **Doctor** intervened and saved a life tonight!")
+                # Announce the doctor save publicly (mention when possible)
+                if doc_target in self.players:
+                    saved_player = self.players[doc_target]
+                    mention = getattr(saved_player.user, 'mention', None) or f"**{saved_player.name}**"
+                    try:
+                        await channel.send(f"✨ The **Doctor** saved {mention} tonight! 👏")
+                    except:
+                        pass
                 # Doctor Bias: Doctor trusts the person they saved (with margin of error)
                 if doc_target in self.players:
                     doctor_id = next((p.id for p in self.players.values() if p.role == 'doctor' and p.is_alive), None)
@@ -847,14 +979,25 @@ class GameLobby:
                 victim = self.players[mafia_target]
                 victim.is_alive = False
                 killed_this_night = True
-                self.logs.append(f"💀 **{victim.name}** was found dead. Role: **{victim.role.upper()}**")
+                mention = getattr(victim.user, 'mention', None) or f"**{victim.name}**"
+                announcement = f"💀 {mention} was found dead. Role: **{victim.role.upper()}**"
+                self.logs.append(announcement)
                 self.death_log.append((self.round, mafia_target, victim.role))
+                try:
+                    await channel.send(announcement)
+                except:
+                    pass
                 if victim.role == 'mafia': 
                     self.mafia_count -= 1
                 else: 
                     self.villager_count -= 1
         else:
-            self.logs.append("🌙 A quiet night. No one died.")
+            announcement = "🌙 A quiet night. No one died."
+            self.logs.append(announcement)
+            try:
+                await channel.send(announcement)
+            except:
+                pass
         
         # --- FAILED KILL SUSPICION: If protection succeeded, town blames someone else ---
         if mafia_target and mafia_target == doc_target and mafia_target in self.players:
@@ -912,7 +1055,7 @@ class GameLobby:
                             self.update_belief(obs_id, obs_id, WEIGHTS['COMPLICITY'])
 
         # --- ACCOUNTABILITY: Eliminate special roles that didn't act ---
-        someone_kicked = False
+        kicked_players = []
         required_to_act = self.actions_required.get('night', [])
         
         for player_id in required_to_act:
@@ -928,10 +1071,19 @@ class GameLobby:
                     self.mafia_count -= 1
                 else:
                     self.villager_count -= 1
-                someone_kicked = True
+                # Append mention if available, otherwise fall back to bold name
+                kicked_players.append(getattr(player.user, 'mention', None) or f"**{player.name}**")
 
-        # If someone was kicked, restart the night phase
-        if someone_kicked:
+        # If someone was kicked, announce and restart the night phase
+        if kicked_players:
+            # Store mentions for final report
+            self.recent_kicked = kicked_players
+
+            try:
+                await channel.send(f"⚠️ The following players were eliminated for failing to act: {', '.join(kicked_players)}")
+            except:
+                pass
+
             self.actions = {}
             self.actions_completed = set()
             self._setup_night_actions()
@@ -941,11 +1093,26 @@ class GameLobby:
                 self.winner = 'villager'
                 self.status = 'finished'
                 await self.update_view(channel, "🏆 **TOWN WINS!** All Mafia eliminated.")
+                # Send an explicit final message tagging survivors and kicked players
+                try:
+                    survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                    kicked = getattr(self, 'recent_kicked', [])
+                    extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                    await channel.send(f"🏆 **TOWN WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+                except:
+                    pass
                 return
             elif self.mafia_count >= self.villager_count:
                 self.winner = 'mafia'
                 self.status = 'finished'
                 await self.update_view(channel, "💀 **MAFIA WINS!** They have taken over the town.")
+                try:
+                    survivors = [getattr(p.user, 'mention', f"**{p.name}**") for p in self.players.values() if p.is_alive]
+                    kicked = getattr(self, 'recent_kicked', [])
+                    extra = f"\n⚠️ Eliminated for failing to act: {', '.join(kicked)}" if kicked else ""
+                    await channel.send(f"💀 **MAFIA WINS!** Final Survivors: {', '.join(survivors)}{extra}")
+                except:
+                    pass
                 return
             
             await self.update_view(channel, f"🌙 **Night {self.round}** (Restart) - Acting roles must choose!")
@@ -987,14 +1154,48 @@ class GameLobby:
     async def update_view(self, channel, message_content=None):
         embed = self.render_embed()
         view = GameView(self)
-        
+
         # Keep logs briefly then clear at next update
         if self.logs and len(self.logs) > 8:
             self.logs = self.logs[-8:]  # Keep last 8 logs
-        
-        # Send new message for each phase/update
-        msg = await channel.send(content=message_content, embed=embed, view=view)
-        self.last_message = msg  # Save message reference for potential future use
+
+        # If the phase has changed since the last panel we displayed, resend a fresh panel message
+        send_new_panel = (self.last_panel_phase != self.phase)
+
+        if send_new_panel or not self.last_message:
+            try:
+                # Send a fresh panel message for the new phase and keep previous panels in the channel
+                msg = await channel.send(content=message_content, embed=embed, view=view)
+                self.last_message = msg
+                self.last_panel_phase = self.phase
+                try:
+                    print(f"[DEBUG] Sent lobby panel msg id={getattr(msg, 'id', None)} phase={self.phase}")
+                except:
+                    pass
+                return
+            except:
+                pass
+
+        # Otherwise try to edit the existing message
+        try:
+            await self.last_message.edit(content=message_content, embed=embed, view=view)
+            try:
+                print(f"[DEBUG] Edited panel msg id={getattr(self.last_message, 'id', None)} phase={self.phase} embed_present={embed is not None}")
+            except:
+                pass
+        except Exception as e:
+            print(f"[DEBUG] Edit failed: {e}")
+            # If edit fails, fall back to sending a new message (keep previous panels)
+            try:
+                msg = await channel.send(content=message_content, embed=embed, view=view)
+                self.last_message = msg
+                self.last_panel_phase = self.phase
+                try:
+                    print(f"[DEBUG] Fallback sent new panel msg id={getattr(msg, 'id', None)} phase={self.phase}")
+                except:
+                    pass
+            except Exception as e2:
+                print(f"[DEBUG] Fallback send failed: {e2}")
 
     def render_embed(self):
         """Enhanced Discord embed with detailed suspicion analytics."""
@@ -1101,8 +1302,33 @@ class GameLobby:
         elif self.phase == 'voting':
             embed.set_footer(text="🗳️ Vote to eliminate. Who will you condemn?")
         elif self.phase == 'night':
-            embed.set_footer(text="🌙 Special roles act in secret. Check your DMs.")
+            embed.set_footer(text="🌙 Special roles act in secret. Click 'Reveal Role (Only you)' to view your role.")
         
+        # Add a role-reveal hint for in-game players regardless of phase
+        if self.status == 'in-game':
+            embed.add_field(name="🔒 Role Reveal", value="Click the 'Reveal Role (Only you)' button to see your role (this message is only visible to you).", inline=False)
+
+        return embed
+    def render_lobby_embed(self, status_text: str = None):
+        """Render the waiting lobby panel showing current players and host."""
+        embed = discord.Embed(
+            title="🕵️ Mafia Enhanced - Lobby",
+            description=status_text or "Click **Join Game** to enter. Minimum 3 players to start.",
+            color=discord.Color.dark_grey()
+        )
+
+        # List players
+        players_txt = "\n".join(
+            [f"{('*' if p.is_host else '')} {getattr(p.user, 'mention', p.name)}" if not p.is_bot else f"🤖 {p.name}" for p in self.players.values()]
+        )
+
+        if not players_txt:
+            players_txt = "No players yet."
+
+        embed.add_field(name="👥 Players", value=players_txt, inline=False)
+        embed.set_footer(text=f"Host: {getattr(self.players.get(self.host_id), 'name', 'Unknown')}")
+        return embed
+
         return embed
 
 # --- DISCORD UI VIEWS ---
@@ -1123,6 +1349,14 @@ class LobbyView(discord.ui.View):
                 f"✅ **{interaction.user.name}** joined! ({player_count} players now)",
                 ephemeral=False
             )
+            # Update the lobby panel to reflect new players
+            try:
+                await self.lobby.update_lobby_panel(interaction.channel)
+                # If now 5 or more players, ensure auto-start is scheduled
+                if len(self.lobby.players) >= 5:
+                    self.lobby.start_auto_start(bot, countdown=30)
+            except:
+                pass
         else:
             await interaction.response.send_message("You are already in the lobby.", ephemeral=True)
 
@@ -1131,15 +1365,21 @@ class LobbyView(discord.ui.View):
         if interaction.user.id != self.lobby.host_id:
             return await interaction.response.send_message("Only the host can start the game.", ephemeral=True)
         
-        success, msg = self.lobby.start_game()
-        if success:
-            await interaction.response.send_message("🎮 **Game Starting...**", ephemeral=True)
-            # Send role reveals to players
-            await self.lobby.send_role_reveals(interaction.channel)
-            # Update the game view
-            await self.lobby.update_view(interaction.channel, msg)
-        else:
-            await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
+        async with self.lobby.lock:
+            if self.lobby.status != 'waiting':
+                return await interaction.response.send_message("❌ Game already started or in progress.", ephemeral=True)
+            
+            success, msg = self.lobby.start_game()
+            if success:
+                await interaction.response.send_message("🎮 **Game Starting...**", ephemeral=True)
+                # Log start
+                print(f"[DEBUG] Host {interaction.user.id} triggered start_game in channel {interaction.channel.id}")
+                # Store role_reveals (no DM)
+                await self.lobby.send_role_reveals(interaction.channel)
+                # Send the initial game panel (update_view will create a fresh panel for the current phase)
+                await self.lobby.update_view(interaction.channel, msg)
+            else:
+                await interaction.response.send_message(f"❌ {msg}", ephemeral=True)
 
 class GameView(discord.ui.View):
     def __init__(self, lobby):
@@ -1158,11 +1398,11 @@ class GameView(discord.ui.View):
         player = self.lobby.players.get(interaction.user.id)
         if not player or not player.is_alive:
             return await interaction.response.send_message("You are dead or not playing.", ephemeral=True)
-        
+
         # Dynamic Select Menu based on phase/role
-        options = []
         alive_players = [p for p in self.lobby.players.values() if p.is_alive]
-        
+        options = []
+
         if self.lobby.phase == 'discussion':
             # Discussion: Accuse, Defend, or Skip
             options = [
@@ -1214,6 +1454,10 @@ class GameView(discord.ui.View):
         else:
             return await interaction.response.send_message("Invalid phase for actions.", ephemeral=True)
 
+        # Guard against empty option lists (Discord requires at least one option)
+        if not options:
+            return await interaction.response.send_message("❌ No valid targets available right now.", ephemeral=True)
+
         view = discord.ui.View(timeout=60)
         select = ActionSelect(self.lobby, options, placeholder, custom_id)
         view.add_item(select)
@@ -1234,15 +1478,26 @@ class GameView(discord.ui.View):
             role_emoji = " 👤"
         
         action_msg = f"You are a **{player.role.title()}**{role_emoji}\n\nSelect your action:{mandatory_msg}"
-        
-        # Send role reveal embed if available (only first time)
+        await interaction.response.send_message(action_msg, view=view, ephemeral=True)
+
+    @discord.ui.button(label="Reveal Role (Only you)", style=discord.ButtonStyle.secondary, custom_id="reveal_role_btn")
+    async def reveal_role_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Send a one-off ephemeral message showing the player's role and mention
+        player = self.lobby.players.get(interaction.user.id)
+        if not player or not player.is_alive:
+            return await interaction.response.send_message("You are dead or not playing.", ephemeral=True)
+
+        # Prefer stored role reveal embed (one-time) if present, otherwise send a small text reveal
         if hasattr(self.lobby, 'role_reveals') and player.id in self.lobby.role_reveals:
             role_embed = self.lobby.role_reveals[player.id]
-            await interaction.response.send_message(embed=role_embed, view=view, ephemeral=True)
-            # Remove it so we don't send again
+            await interaction.response.send_message(embed=role_embed, ephemeral=True)
+            # Remove to avoid re-sending
             del self.lobby.role_reveals[player.id]
-        else:
-            await interaction.response.send_message(action_msg, view=view, ephemeral=True)
+            return
+
+        mention = getattr(player.user, 'mention', None) or f"**{player.name}**"
+        role = player.role.upper()
+        await interaction.response.send_message(f"🔒 {mention} — Your role is **{role}**. (This message is only visible to you)", ephemeral=True)
     
     @discord.ui.button(label="End Phase (Host Only)", style=discord.ButtonStyle.danger, custom_id="end_phase_btn")
     async def end_phase_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1476,17 +1731,18 @@ class ActionSelect(discord.ui.Select):
 @bot.tree.command(name="mafia_create", description="Create a new Mafia lobby")
 async def create_lobby(interaction: discord.Interaction):
     """Create a new Mafia game lobby in this channel."""
-    if interaction.channel_id in bot.lobbies:
-        existing_lobby = bot.lobbies[interaction.channel_id]
-        # Allow creating new lobby if the existing one is finished
-        if existing_lobby.status != 'finished':
-            await interaction.response.send_message("❌ A lobby already exists in this channel.", ephemeral=True)
-            return
-        # Remove the finished lobby
-        del bot.lobbies[interaction.channel_id]
-    
-    lobby = GameLobby(interaction.channel_id, interaction.user)
-    bot.lobbies[interaction.channel_id] = lobby
+    async with bot.lobbies_lock:
+        if interaction.channel_id in bot.lobbies:
+            existing_lobby = bot.lobbies[interaction.channel_id]
+            # Allow creating new lobby if the existing one is finished
+            if existing_lobby.status != 'finished':
+                await interaction.response.send_message("❌ A lobby already exists in this channel.", ephemeral=True)
+                return
+            # Remove the finished lobby
+            del bot.lobbies[interaction.channel_id]
+        
+        lobby = GameLobby(interaction.channel_id, interaction.user)
+        bot.lobbies[interaction.channel_id] = lobby
     
     embed = discord.Embed(
         title="🕵️ New Mafia Lobby", 
@@ -1496,6 +1752,14 @@ async def create_lobby(interaction: discord.Interaction):
     embed.set_footer(text="Created by Mafia Enhanced Bot")
     view = LobbyView(lobby)
     await interaction.response.send_message(embed=embed, view=view)
+    try:
+        # Save the message so we can edit the original lobby panel later
+        msg = await interaction.original_response()
+        lobby.last_message = msg
+        # Schedule auto-start countdown (30 sec) that activates if 5+ players
+        lobby.start_auto_start(bot, countdown=30)
+    except:
+        pass
 
 @bot.tree.command(name="mafia_end", description="End the current game (host only)")
 async def end_game(interaction: discord.Interaction):
@@ -1629,17 +1893,18 @@ async def on_ready():
 @bot.command(name="mafia_create")
 async def mafia_create_prefix(ctx):
     """Create a new Mafia lobby using &mafia_create"""
-    if ctx.channel.id in bot.lobbies:
-        existing_lobby = bot.lobbies[ctx.channel.id]
-        # Allow creating new lobby if the existing one is finished
-        if existing_lobby.status != 'finished':
-            await ctx.send("❌ A lobby already exists in this channel.")
-            return
-        # Remove the finished lobby
-        del bot.lobbies[ctx.channel.id]
-    
-    lobby = GameLobby(ctx.channel.id, ctx.author)
-    bot.lobbies[ctx.channel.id] = lobby
+    async with bot.lobbies_lock:
+        if ctx.channel.id in bot.lobbies:
+            existing_lobby = bot.lobbies[ctx.channel.id]
+            # Allow creating new lobby if the existing one is finished
+            if existing_lobby.status != 'finished':
+                await ctx.send("❌ A lobby already exists in this channel.")
+                return
+            # Remove the finished lobby
+            del bot.lobbies[ctx.channel.id]
+        
+        lobby = GameLobby(ctx.channel.id, ctx.author)
+        bot.lobbies[ctx.channel.id] = lobby
     
     embed = discord.Embed(
         title="🕵️ New Mafia Lobby", 
@@ -1648,7 +1913,11 @@ async def mafia_create_prefix(ctx):
     )
     embed.set_footer(text="Created by Mafia Enhanced Bot")
     view = LobbyView(lobby)
-    await ctx.send(embed=embed, view=view)
+    msg = await ctx.send(embed=embed, view=view)
+    # Save the message so we can edit the original lobby panel later
+    lobby.last_message = msg
+    # Schedule auto-start countdown (30 sec) that activates if 5+ players
+    lobby.start_auto_start(bot, countdown=30)
 
 @bot.command(name="mafia_end")
 async def mafia_end_prefix(ctx):
